@@ -14,6 +14,7 @@ import streamlit as st
 # GLOBAL DEBUG REGISTRY (for clean, structured logs)
 # ==============================================================
 EXTRACT_DEBUG_REGISTRY = {}  # { filename: {...} }
+
 # ----------------------------------------------------------------------------------------------------------------------
 # TEXT EXTRACTION UTILITIES
 # ----------------------------------------------------------------------------------------------------------------------
@@ -700,7 +701,29 @@ def score_resume_v2(
 st.set_page_config(layout="wide", page_title="HIRE HUB — Robust")
 APP_BG_COLOR = "#f4f8ff"
 
-# >>> ADDED/CHANGED: global CSS + a green variant class we can toggle
+st.markdown("""
+<style>
+.use-jd-btn-wrap div.stButton > button:first-child {
+    background-color: #16a34a !important;  /* Green */
+    color: #ffffff !important;
+    font-size: 18px !important;
+    font-weight: bold !important;
+    border-radius: 12px !important;
+    padding: 12px 28px !important;
+    border: none !important;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.2) !important;
+    transition: all 0.3s ease-in-out !important;
+}
+/* Hover effect */
+.use-jd-btn-wrap div.stButton > button:first-child:hover {
+    background-color: #22c55e !important;  /* Lighter green on hover */
+    transform: scale(1.05);
+    box-shadow: 0 6px 14px rgba(0,0,0,0.25);
+}
+</style>
+""", unsafe_allow_html=True)
+
+# >>> UPDATED: global CSS (overlay CSS removed, JD card will be inline)
 st.markdown(f"""
 <style>
 .stApp {{ background: linear-gradient(180deg, {APP_BG_COLOR} 0%, #ffffff 100%); }}
@@ -716,10 +739,29 @@ st.markdown(f"""
 .badge.red {{ background-color: #dc2626; }} /* Rejected */
 .small-note {{ color:#64748b; font-size:12px; }}
 
-/* >>> ADDED: when JD form is used, make the submit button green */
-.jd-form-used button[kind="primary"] {{
-  background-color: #16a34a !important;
-  border-color: #16a34a !important;
+/* JD card styling (centered block) */
+.jd-inline-card {{
+  max-width: 600px;
+  margin: 10px auto 18px auto;
+  background: #ffffff;
+  border-radius: 18px;
+  padding: 20px 18px 16px 18px;
+  box-shadow: 0 12px 40px rgba(15,23,42,0.12);
+}}
+.jd-modal-title {{
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}}
+.jd-modal-sub {{
+  font-size: 13px;
+  color: #6b7280;
+  margin-bottom: 12px;
+}}
+.jd-modal-footer-text {{
+  font-size: 11px;
+  color: #9ca3af;
+  margin-top: 4px;
 }}
 </style>
 """, unsafe_allow_html=True)
@@ -728,13 +770,16 @@ st.markdown(f"""<div class="header"><h2 style="margin:0; font-weight:700;">📄 
 
 st.sidebar.title("⚙️ Uploads")
 
-# Reset button
+# Reset & JD form state
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 if "jd_form_payload" not in st.session_state:
     st.session_state.jd_form_payload = None
 if "jd_mandatory_from_file" not in st.session_state:
     st.session_state.jd_mandatory_from_file = set()
+# NEW: JD form visibility flag
+if "show_jd_modal" not in st.session_state:
+    st.session_state.show_jd_modal = False
 
 # >>> ADDED: results persistence keys
 if "results_df" not in st.session_state:
@@ -757,6 +802,7 @@ if st.sidebar.button("🔄 Reset All Uploads"):
     st.session_state.results_df = None
     st.session_state.results_html_table = None
     st.session_state.show_results_now = False
+    st.session_state.show_jd_modal = False
     st.rerun()
 
 # Sidebar uploads
@@ -788,23 +834,44 @@ if resume_zip:
 
 aggressive_edu_exclusion = st.sidebar.checkbox("⚡ Aggressive Education Date Exclusion", value=True)
 
-# NEW: JD structured form
-st.sidebar.markdown("### 🧩 JD Form (optional)")
-with st.sidebar.expander("Fill JD details without a file"):
-    # >>> ADDED: container that can get green class after used
-    jd_form_css_class = "jd-form-used" if st.session_state.get("jd_form_payload") else ""
-    with st.form("jd_form"):
-        # Put a small hidden marker div to apply class to the form block if used
-        if jd_form_css_class:
-            st.markdown(f'<div class="{jd_form_css_class}"></div>', unsafe_allow_html=True)  # cosmetic hook
+process_button = st.sidebar.button("🚀 Start Shortlisting", type="primary")
 
+# ----------------------------------------------------------------------------------------------------------------------
+# CENTER BUTTON — OPEN JD FORM "MODAL" (inline card)
+# ----------------------------------------------------------------------------------------------------------------------
+st.markdown(
+    '<div style="text-align:center; margin: 18px 0 4px 0;">',
+    unsafe_allow_html=True
+)
+open_modal = st.button("✅ Use JD Form", key="open_jd_modal", type="secondary", help="Fill JD details without a file")
+st.markdown('</div>', unsafe_allow_html=True)
+
+if open_modal:
+    st.session_state.show_jd_modal = True
+    st.rerun()
+
+# ----------------------------------------------------------------------------------------------------------------------
+# JD FORM INLINE CARD (same fields as before, no blocking overlay)
+# ----------------------------------------------------------------------------------------------------------------------
+if st.session_state.show_jd_modal:
+    st.markdown('<div class="jd-modal-title">Job Description Form</div>', unsafe_allow_html=True)
+    st.markdown('<div class="jd-modal-sub">Fill in JD details if you don\'t have a JD file, or want to override it.</div>', unsafe_allow_html=True)
+    
+    with st.form("jd_form_modal"):
         role_title = st.text_input("Role Title", placeholder="e.g., Embedded Linux Engineer")
         min_exp_years = st.number_input("Minimum Experience (years)", min_value=0, max_value=50, value=0, step=1)
-        jd_mandatory_str = st.text_area("Mandatory Skills (comma-separated)", placeholder="e.g., Embedded C, Linux, Device Tree, U-Boot")
-        jd_optional_str = st.text_area("Optional/Nice-to-have Skills (comma-separated)", placeholder="e.g., Yocto, SPI, I2C, UART")
+        jd_mandatory_str = st.text_area(
+            "Mandatory Skills (comma-separated)",
+            placeholder="e.g., Embedded C, Linux, Device Tree, U-Boot"
+        )
+        jd_optional_str = st.text_area(
+            "Optional/Nice-to-have Skills (comma-separated)",
+            placeholder="e.g., Yocto, SPI, I2C, UART"
+        )
 
-        # >>> CHANGED: make it primary (blue), and turn GREEN when form is active via CSS above
-        use_form = st.form_submit_button("Use JD Form", type="primary", help="Click to apply JD form values")
+        col_apply, col_cancel = st.columns([1,1])
+        use_form = col_apply.form_submit_button("Apply JD Form", type="primary")
+        cancel_form = col_cancel.form_submit_button("Cancel")
 
         if use_form:
             def canonize_list(s):
@@ -825,11 +892,19 @@ with st.sidebar.expander("Fill JD details without a file"):
                 "mandatory": canonize_list(jd_mandatory_str),
                 "optional": canonize_list(jd_optional_str),
             }
-            # >>> ADDED: toast + rerun to apply green CSS to the submit button
+            st.session_state.show_jd_modal = False
             st.toast("JD Form applied.", icon="✅")
             st.rerun()
 
-process_button = st.sidebar.button("🚀 Start Shortlisting", type="primary")
+        if cancel_form:
+            st.session_state.show_jd_modal = False
+            st.rerun()
+
+    st.markdown(
+        '<div class="jd-modal-footer-text">Tip: Once applied, this JD form will override any uploaded JD file unless you reset uploads.</div>',
+        unsafe_allow_html=True
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # ----- Tabs
 tab1, tab2 = st.tabs(["📘 Job Description", "🧾 Resumes"])
@@ -852,7 +927,7 @@ with tab1:
         st.markdown(f"**Optional (form)**: {', '.join(sorted(list(p['optional']))) or '—'}")
         jd_keywords = (p["mandatory"] | p["optional"])
         jd_min_exp = p["min_exp"]
-        st.info("You can still upload a JD file, but the form values will be used.")
+        st.info("You can still upload a JD file, but the form values from the center-button JD Form will be used.")
     else:
         if jd_file:
             if jd_file.type == "application/pdf":
@@ -894,7 +969,7 @@ with tab1:
         else:
             jd_keywords = set()
             jd_min_exp = 0
-            st.info("Upload JD (PDF/TXT) or use the JD Form in sidebar.")
+            st.info("Upload JD (PDF/TXT) or click **Use JD Form** in the center of the page.")
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -918,7 +993,6 @@ with tab2:
 # ----------------------------------------------------------------------------------------------------------------------
 # Helper: Result rendering (used both for auto-show and in Tab 3)
 # ----------------------------------------------------------------------------------------------------------------------
-# >>> CHANGED: added key_suffix to give download_button a unique key depending on where we render
 def render_results_block(df, jd_min_exp_value, jd_all_skills, jd_mandatory, jd_optional, key_suffix: str = "default"):
     """Renders the results table, top 3 cards, and download button from a df already computed."""
     st.success(f"Processed {len(df)} resume(s).")
@@ -934,7 +1008,7 @@ def render_results_block(df, jd_min_exp_value, jd_all_skills, jd_mandatory, jd_o
 
         st.markdown("### Shortlisted Candidates")
 
-        # HTML table (persist a stable HTML so that download-trigger re-runs don't recalc)
+        # HTML table
         html_table = df[[
             "Candidate Name",
             "Score",
@@ -951,13 +1025,12 @@ def render_results_block(df, jd_min_exp_value, jd_all_skills, jd_mandatory, jd_o
         wrapper = f'<div class="hirehub-wrapper">{html_table}</div>'
         st.markdown(wrapper, unsafe_allow_html=True)
 
-        # Prepare Excel bytes once
+        # Excel bytes
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine='openpyxl') as writer:
             df.to_excel(writer, index=False, sheet_name='Shortlisted')
         buf.seek(0)
 
-        # >>> UNIQUE KEY HERE (prevents duplicate ID if rendered in multiple places)
         st.download_button(
             "📥 Download Shortlisted Candidates (Excel)",
             buf,
@@ -965,15 +1038,12 @@ def render_results_block(df, jd_min_exp_value, jd_all_skills, jd_mandatory, jd_o
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"download_excel_{key_suffix}",
         )
-        # Persist HTML for re-renders after download
         st.session_state.results_html_table = wrapper
     else:
         st.info("No candidates to display after filters.")
 
-
-
 # ----------------------------------------------------------------------------------------------------------------------
-# PROCESS ACTION — this computes results, persists to session, and auto-shows results
+# PROCESS ACTION
 # ----------------------------------------------------------------------------------------------------------------------
 if process_button:
     combined_resumes = list(st.session_state.get("resume_files") or [])
@@ -1015,10 +1085,8 @@ if process_button:
             else:
                 jd_text = extract_text_from_txt(jd_file)
             jd_all_skills = get_keywords_from_jd(jd_text)
-            # Mandatory from user selection (if any)
             jd_mandatory = set(st.session_state.jd_mandatory_from_file or set())
             jd_optional = jd_all_skills - jd_mandatory
-            # Min exp parse again to be safe
             jd_min_exp = 0
             for pat in [r'(\d+)\s*\+\s*years', r'(\d+)\s*\-\s*\d+\s*years',
                         r'minimum\s*of\s*(\d+)\s*years', r'at\s*least\s*(\d+)\s*years',
@@ -1058,7 +1126,6 @@ if process_button:
             except Exception:
                 txt = ""
 
-            # Score using mandatory-first
             scr = score_resume_v2(
                 txt,
                 jd_all_skills=jd_all_skills,
@@ -1069,7 +1136,6 @@ if process_button:
                 aggressive_edu=aggressive_edu_exclusion
             )
 
-            # Pretty console debug (kept your style)
             src_info = EXTRACT_DEBUG_REGISTRY.get(fname, {})
             src = src_info.get("source", "n/a")
             print("\n" + "-"*78)
@@ -1113,13 +1179,9 @@ if process_button:
             })
             progress.progress((i + 1) / total)
 
-        # Sort & show
         df = pd.DataFrame(sorted(results, key=lambda x: (x['Score'], -x["Mandatory Missing Count"]), reverse=True))
-
-        # >>> ADDED: persist results & minimal summary and auto-show
         st.session_state.results_df = df
 
-        # cache a tiny summary for the auto-render area (top-3)
         if not df.empty:
             tk = df.head(3)
             st.session_state.last_summary = tk.to_dict('records')
@@ -1131,16 +1193,14 @@ if process_button:
         st.rerun()
 
 # ----------------------------------------------------------------------------------------------------------------------
-# AUTO SHOW RESULTS AREA (placed above tabs after processing)
+# AUTO SHOW RESULTS AREA
 # ----------------------------------------------------------------------------------------------------------------------
 if st.session_state.show_results_now and st.session_state.results_df is not None:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Results")
-    # Render directly here with a dedicated key suffix to avoid duplicate download_button ID
     render_results_block(
         st.session_state.results_df,
         0, set(), set(), set(),
-        key_suffix="autoshow"   # >>> UNIQUE key suffix for autoshow area
+        key_suffix="autoshow"
     )
     st.markdown('</div>', unsafe_allow_html=True)
-    # Note: we keep the tabbed Results as well. The user has both views.
