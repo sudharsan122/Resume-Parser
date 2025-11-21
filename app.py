@@ -748,6 +748,17 @@ st.markdown(f"""
   padding: 20px 18px 16px 18px;
   box-shadow: 0 12px 40px rgba(15,23,42,0.12);
 }}
+
+.header {{
+  background: linear-gradient(135deg, #0ea5e9 0%, #1f6feb 60%, #9333ea 100%);
+  padding: 18px 22px;
+  border-radius: 12px;
+  color: #fff;
+  box-shadow: var(--shadow);
+  position: sticky;
+  top: 8px;
+  z-index: 10;
+}}
 .jd-modal-title {{
   font-size: 20px;
   font-weight: 700;
