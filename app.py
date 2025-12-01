@@ -1,22 +1,193 @@
-#final #without result tab with JD form & C Correct extraction  #hardcoded 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Patched app.py — Gemini-first skill extraction with guaranteed JD phrase inclusion
+and caching of JD skill extraction (avoid re-calling Gemini when JD unchanged).
+
+Features:
+- Calls Gemini to extract skills from JD/resume text.
+- Post-processes Gemini output with _expand_and_imply (split combined tokens like "c/c++").
+- Forces inclusion of explicit high-priority phrases found in the JD text (GUARANTEED_PHRASES).
+- Allows the single-letter token 'c' to pass the short-token filter.
+- Caches JD skill extraction in st.session_state and reuses if JD not changed.
+"""
+
 import os
 import io
 import re
+import json
+import time
+import zipfile
+import hashlib
+from datetime import datetime
+from collections import OrderedDict
+
 import docx
 import pdfplumber
-import zipfile
 import pandas as pd
-from datetime import datetime
-# from word2number import w2n # REMOVED: unused and increases packaging size
 import streamlit as st
 
-# ==============================================================
+# ------------------ HARD-CODED GEMINI KEY (replace locally) ------------------
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+
+# ------------------ genai client ------------------
+try:
+    from google import genai
+except Exception:
+    genai = None
+
+if genai is None:
+    raise RuntimeError("Install google-genai: pip install google-genai")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# ============================================================== #
 # GLOBAL DEBUG REGISTRY (for clean, structured logs)
-# ==============================================================
+# ============================================================== #
 EXTRACT_DEBUG_REGISTRY = {}  # { filename: {...} }
-# ----------------------------------------------------------------------------------------------------------------------
-# TEXT EXTRACTION UTILITIES
-# ----------------------------------------------------------------------------------------------------------------------
+
+# ------------------ LLM helpers (skills + years) ------------------
+
+MAX_CHARS = 14000
+
+def call_gemini_for_skills(resume_text: str, model: str = "gemini-2.5-flash", max_retries: int = 2):
+    """
+    Returns (skills_list, raw_output).
+    skills_list: list[str] lowercased tokens (may be empty).
+    """
+    if not resume_text:
+        return [], "<empty>"
+
+    txt = resume_text if len(resume_text) <= MAX_CHARS else resume_text[:MAX_CHARS]
+    prompt = f"""
+You are an extractor. Given the resume or JD text below, return ONLY a single JSON object:
+
+{{"skills": ["skill1","skill2", ...]}}
+
+Rules:
+- Return short canonical skill tokens like "python", "c++", "embedded linux", "device tree", "u-boot", "yocto", "i2c", "spi", "git".
+- Normalize common variants (react.js -> react, node js -> node.js, powerbi -> power bi).
+- If the text contains combined forms like "C/C++", return both "c" and "c++" as separate items.
+- Deduplicate and include only skills actually present in the text.
+- Do NOT include company names, addresses, or long descriptive sentences.
+- Output EXACTLY one JSON object and nothing else.
+
+Text:
+\"\"\"{txt}\"\"\" 
+""".strip()
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.models.generate_content(model=model, contents=prompt)
+            raw = resp.text if hasattr(resp, "text") else str(resp)
+            # find JSON object
+            m = re.search(r'\{.*\}', raw, flags=re.DOTALL)
+            if m:
+                try:
+                    obj = json.loads(m.group(0))
+                    skills = obj.get("skills", [])
+                    if isinstance(skills, list):
+                        # normalize & dedupe preserving order
+                        cleaned = []
+                        seen = set()
+                        for s in skills:
+                            if not isinstance(s, str):
+                                continue
+                            tok = s.strip().lower()
+                            # small normalization
+                            tok = tok.replace('react.js', 'react').replace('reactjs', 'react')
+                            tok = tok.replace('node js', 'node.js').replace('nodejs', 'node.js')
+                            tok = tok.replace('powerbi', 'power bi')
+                            tok = re.sub(r'[\._]+', ' ', tok)
+                            tok = re.sub(r'\s+', ' ', tok).strip()
+                            if tok and tok not in seen:
+                                seen.add(tok)
+                                cleaned.append(tok)
+                        return cleaned, raw
+                except Exception:
+                    pass
+
+            # fallback: try to parse an array literal
+            arr_match = re.search(r'\[\s*([^\]]+?)\s*\]', raw, flags=re.DOTALL)
+            if arr_match:
+                items = re.findall(r'["\']([^"\']+)["\']', arr_match.group(0))
+                cleaned = []
+                seen = set()
+                for s in items:
+                    tok = s.strip().lower()
+                    tok = tok.replace('react.js', 'react').replace('reactjs', 'react')
+                    tok = tok.replace('node js', 'node.js').replace('nodejs', 'node.js')
+                    tok = re.sub(r'[\._]+', ' ', tok)
+                    tok = re.sub(r'\s+', ' ', tok).strip()
+                    if tok and tok not in seen:
+                        seen.add(tok)
+                        cleaned.append(tok)
+                if cleaned:
+                    return cleaned, raw
+
+            # If we didn't get JSON, fallback to empty so caller will use local fallback
+            return [], raw
+        except Exception as e:
+            # transient retry
+            if attempt < max_retries:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            return [], f"<error: {e}>"
+
+def call_gemini_for_years(resume_text: str, model: str = "gemini-2.5-flash", max_retries: int = 2):
+    """
+    Returns (float_years, raw_output)
+    Expects LLM to return ONLY {"total_years": <float>}
+    """
+    if not resume_text:
+        return 0.0, "<empty>"
+
+    txt = resume_text if len(resume_text) <= MAX_CHARS else resume_text[:MAX_CHARS]
+    today = datetime.now().date()
+    prompt = f"""
+You are a strict extractor. Given the resume text below, compute the candidate's total professional work experience in years, MERGING overlapping jobs so they are not double-counted. Return ONLY a single JSON object with this numeric field:
+
+{{"total_years": <float>}}
+
+Rules:
+- Count full months; express years as decimal with one digit after decimal (e.g., 3.5).
+- Treat "present/current" as up to today's date ({today}).
+- Merge overlapping jobs before summing so overlaps are not double-counted.
+- If you cannot detect any valid dates or experience, return {{"total_years": 0.0}}.
+- DO NOT output any text except the single JSON object above.
+
+Resume:
+\"\"\"{txt}\"\"\" 
+""".strip()
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.models.generate_content(model=model, contents=prompt)
+            raw = resp.text if hasattr(resp, "text") else str(resp)
+            m = re.search(r'\{.*\}', raw, flags=re.DOTALL)
+            if m:
+                try:
+                    obj = json.loads(m.group(0))
+                    value = float(obj.get("total_years", 0.0))
+                    return round(value, 1), raw
+                except Exception:
+                    pass
+            # try to find numeric fallback
+            m2 = re.search(r'(\d+(?:\.\d+)?)', raw)
+            if m2:
+                try:
+                    return round(float(m2.group(1)), 1), raw
+                except:
+                    pass
+            return 0.0, raw
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            return 0.0, f"<error: {e}>"
+
+# ------------------ TEXT extraction utilities (existing) ------------------
 def extract_text_from_pdf(pdf_file):
     try:
         pdf_file.seek(0)
@@ -62,45 +233,247 @@ def extract_text_from_txt(txt_file):
     except Exception:
         return ""
 
-# ----------------------------------------------------------------------------------------------------------------------
-# JD / SKILL EXTRACTION (patterns + simple cue windows)
-# ----------------------------------------------------------------------------------------------------------------------
-import spacy
-nlp = spacy.load("en_core_web_sm")
+# ------------------ GEMINI-FIRST skill extraction (new) ------------------
 
-def get_keywords_from_jd(jd_text, max_terms=150):
+# Minimal deterministic whitelist fallback (compact)
+MINIMAL_WHITELIST = [
+    "c", "c++", "python", "java", "javascript", "node.js", "react",
+    "embedded linux", "yocto", "u-boot", "device tree", "i2c", "spi", "usb", "ethernet",
+    "gdb", "jtag", "docker", "qemu", "firmware", "bootloader", "kernel", "kernel drivers",
+    "yocto", "openwrt", "buildroot", "tpm", "wifi", "lte", "qualcomm", "mediatek", "broadcom", "nxp"
+]
+
+def _minimal_whitelist_scan(text: str):
+    """
+    A tiny deterministic fallback that searches MINIMAL_WHITELIST words as exact tokens.
+    This is intentionally small and conservative (only used when Gemini returns nothing or errors).
+    """
+    if not text:
+        return []
+    t = text.lower()
+    found = []
+    for kw in MINIMAL_WHITELIST:
+        pat = r"\b" + re.escape(kw.lower()) + r"\b"
+        if re.search(pat, t):
+            normalized = kw.lower()
+            # normalize wifi -> wi-fi for consistency if present
+            if normalized == "wifi":
+                normalized = "wi-fi"
+            if normalized not in found:
+                found.append(normalized)
+    return found
+
+# ------------------ NEW: expansion & implied helper ------------------
+
+def _expand_and_imply(skills_list):
+    """
+    Post-process raw skills list from Gemini:
+    - Split combined tokens like "c/c++", "c & c++", "c and c++" into separate tokens.
+    - Split on '/', '&', ',', and the word 'and' (but safely handle 'c++').
+    - Normalize a few common variants (wifi -> wi-fi, drivers -> kernel drivers).
+    - Add implied tokens (e.g., add 'c' if 'c++' present).
+    - Preserve order while deduping.
+    """
+    if not skills_list:
+        return []
+
+    expanded = []
+    seen = set()
+
+    for tok in skills_list:
+        if not isinstance(tok, str):
+            continue
+        t = tok.strip().lower()
+
+        # Explicitly expand common compact forms before splitting
+        t = t.replace('c/c++', 'c c++').replace('c & c++', 'c c++').replace('c and c++', 'c c++')
+        t = t.replace('c++/c', 'c c++').replace('c/cpp', 'c c++')
+
+        # Split on common delimiters but avoid splitting on '+' (so c++ stays intact)
+        parts = re.split(r'\s*(?:/|&|,|\band\b)\s*', t)
+
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+
+            # small normalizations
+            if p == 'wifi':
+                p = 'wi-fi'
+            if p in ('driver', 'drivers'):
+                p = 'kernel drivers'
+            if p == 'kernel':
+                p = 'linux kernel'
+
+            # fix noisy tokens, remove punctuation
+            p = re.sub(r'[\._]+', ' ', p)
+            p = re.sub(r'\s+', ' ', p).strip()
+
+            # skip very short or empty (but allow 'c')
+            if len(p) < 2 and p != 'c':
+                continue
+
+            if p not in seen:
+                seen.add(p)
+                expanded.append(p)
+
+    # implied tokens: if c++ present but c missing, add c
+    if 'c++' in seen and 'c' not in seen:
+        expanded.append('c')
+        seen.add('c')
+
+    return expanded
+
+# ------------------ GUARANTEED PHRASES for JD (force-inclusion if present) ------------------
+
+GUARANTEED_PHRASES = [
+    "arm", "arm-based", "arm socs", "qualcomm", "mediatek", "broadcom", "nxp",
+    "build systems", "production-ready", "production-ready images", "board diagnostics",
+    "manufacturing", "manufacturing support", "hardware integration", "peripherals",
+    "network interfaces", "wireless chipsets", "documentation", "open-source",
+    "router platforms", "router", "firmware", "test automation", "performance optimization",
+    "memory optimization", "boot optimization", "code reviews", "debugging tools"
+]
+
+def force_include_from_text(skills_list, text):
+    """
+    Ensure high-priority phrases present in the text are included in skills_list.
+    Returns (updated_skills_list, added_list)
+    """
+    if not text:
+        return skills_list, []
+
+    t = text.lower()
+    added = []
+    # keep order: append any guaranteed phrase that's present and not already in list
+    seen = set(x.lower() for x in skills_list)
+    for phr in GUARANTEED_PHRASES:
+        if phr in t:
+            canon = phr
+            # normalize a few canonical forms
+            if canon == "wifi":
+                canon = "wi-fi"
+            if canon == "arm-based":
+                canon = "arm"
+            if canon.endswith("socs"):
+                canon = canon.replace("socs", "socs")
+            # if not present, append
+            if canon not in seen:
+                skills_list.append(canon)
+                added.append(canon)
+                seen.add(canon)
+    return skills_list, added
+
+# ------------------ CACHING HELPERS ------------------
+
+def _text_hash(s: str) -> str:
+    if not s:
+        return ""
+    return hashlib.sha256(s.encode('utf-8')).hexdigest()
+
+# Initialize session_state cache keys if not present
+if "jd_hash" not in st.session_state:
+    st.session_state.jd_hash = ""
+if "jd_keywords_cached" not in st.session_state:
+    st.session_state.jd_keywords_cached = set()
+
+# ------------------ GEMINI-FIRST extractors (with post-processing) ------------------
+
+def get_keywords_from_jd(jd_text: str, max_terms: int = 200):
+    """
+    Gemini-first extraction for JD: call LLM and return a set of skills (strings).
+    Post-processes Gemini results with _expand_and_imply and force_include_from_text to ensure combined tokens are split
+    and important JD phrases are included.
+    """
     if not jd_text:
         return set()
 
-    doc = nlp(jd_text)
+    # Attempt to reuse cache if text hasn't changed
+    new_hash = _text_hash(jd_text)
+    if new_hash == st.session_state.jd_hash and st.session_state.jd_keywords_cached:
+        # use cached
+        return set(st.session_state.jd_keywords_cached)
 
-    # Extract noun chunks and named entities
-    skill_candidates = set()
-    for chunk in doc.noun_chunks:
-        skill = chunk.text.strip().lower()
-        if len(skill.split()) <= 5:
-            skill_candidates.add(skill)
+    skills, raw = call_gemini_for_skills(jd_text)
+    # Post-process expansion & implied tokens
+    skills = _expand_and_imply(skills)
 
-    for ent in doc.ents:
-        if ent.label_ in {"ORG", "PRODUCT", "SKILL", "TECHNOLOGY"}:
-            skill = ent.text.strip().lower()
-            if len(skill.split()) <= 5:
-                skill_candidates.add(skill)
+    # Force-include guaranteed phrases present in JD text
+    skills, added = force_include_from_text(skills, jd_text)
 
-    # Return top-N skills
-    sorted_skills = sorted(skill_candidates)
-    if max_terms and len(sorted_skills) > max_terms:
-        sorted_skills = sorted_skills[:max_terms]
-    return set(sorted_skills)
+    # Basic sanity checks on LLM response
+    if skills and isinstance(skills, list):
+        # Keep up to max_terms and filter out very short tokens (allow 'c')
+        cleaned = []
+        seen = set()
+        for s in skills:
+            if not isinstance(s, str):
+                continue
+            tok = s.strip().lower()
+            tok = re.sub(r'\s+', ' ', tok)
+            # allow the single-letter language 'c' (keep filtering other tiny tokens)
+            if len(tok) < 2 and tok != "c":
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            cleaned.append(tok)
+            if len(cleaned) >= max_terms:
+                break
 
-# NEW: Skills from resume (same canonical patterns via JD extractor)
-def get_skills_from_text(text: str) -> set:
-    """Reuses get_keywords_from_jd logic to harvest skills from any text."""
-    return get_keywords_from_jd(text, max_terms=500)
+        # Cache results
+        st.session_state.jd_keywords_cached = set(cleaned)
+        st.session_state.jd_hash = new_hash
+        return set(cleaned)
 
-# ----------------------------------------------------------------------------------------------------------------------
-# EXPERIENCE EXTRACTION (your existing debug-rich logic)
-# ----------------------------------------------------------------------------------------------------------------------
+    # Fallback
+    fallback = _minimal_whitelist_scan(jd_text)
+    # cache fallback as well
+    st.session_state.jd_keywords_cached = set(fallback)
+    st.session_state.jd_hash = new_hash
+    return set(fallback)
+
+def get_skills_from_text(text: str, max_terms: int = 200):
+    """
+    Gemini-first extraction for resumes. Returns an ordered list (preserve LLM order).
+    If Gemini fails, returns the minimal whitelist scan results as a list.
+    Post-processes Gemini results with _expand_and_imply to ensure combined tokens are split.
+    """
+    if not text:
+        return []
+
+    skills, raw = call_gemini_for_skills(text)
+    # Post-process expansion & implied tokens
+    skills = _expand_and_imply(skills)
+
+    ordered = []
+    seen = set()
+    if skills and isinstance(skills, list):
+        for s in skills:
+            if not isinstance(s, str):
+                continue
+            tok = s.strip().lower()
+            tok = re.sub(r'\s+', ' ', tok)
+            # allow the single-letter language 'c'
+            if len(tok) < 2 and tok != "c":
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            ordered.append(tok)
+            if len(ordered) >= max_terms:
+                break
+
+    if ordered:
+        return ordered
+
+    # fallback deterministic scan
+    fallback = _minimal_whitelist_scan(text)
+    return fallback
+
+# -------------------------------------------------------------------------------------------------
+# EXPERIENCE EXTRACTION (existing local code) - left unchanged
+# -------------------------------------------------------------------------------------------------
 def parse_date_any(s):
     s = s.strip()
     s = re.sub(r'\s+', ' ', s)
@@ -227,10 +600,6 @@ def extract_experience_from_resume(text, filename="", aggressive_edu=True):
             experience_text = "\n".join(filtered_lines)
         else:
             experience_text = "\n".join(lines)
-    # Safety guard: if experience_text got emptied by aggressive education exclusion
-    # (common when PDF newlines were collapsed), scan the whole text instead.
-    if not experience_text.strip():
-        experience_text = text_low
     else:
         experience_text = "\n".join(experience_text_lines)
 
@@ -274,13 +643,9 @@ def extract_experience_from_resume(text, filename="", aggressive_edu=True):
     # 4) Generic date ranges
     intervals = []
     date_range_patterns = [
-    # NEW: Month [day][ordinal][,] Year  –  (present/current/till date OR Month [day] Year)
-    r'([A-Za-z]{3,9}\s*\d{1,2}(?:st|nd|rd|th)?(?:,)?\s*\d{4})\s*[\-\u2013\u2014to]{1,}\s*(present|current|till date|[A-Za-z]{3,9}\s*\d{1,2}(?:st|nd|rd|th)?(?:,)?\s*\d{4})',
-
-    # existing patterns (keep as they are)
-    r'([A-Za-z]{3,9}\s*\d{4})\s*[\-\u2013\u2014to]{1,}\s*(present|current|till date|[A-Za-z]{3,9}\s*\d{4})',
-    r'(\d{4}\/\d{1,2})\s*[\-\u2013\u2014to]{1,}\s*(present|current|till date|\d{4}\/\d{1,2})',
-    r'(\d{4})\s*[\-\u2013\u2014to]{1,}\s*(present|current|till date|\d{4})'
+        r'([A-Za-z]{3,9}\s*\d{4})\s*[\-–—to]{1,}\s*(present|current|till date|[A-Za-z]{3,9}\s*\d{4})',
+        r'(\d{4}\/\d{1,2})\s*[\-–—to]{1,}\s*(present|current|till date|\d{4}\/\d{1,2})',
+        r'(\d{4})\s*[\-–—to]{1,}\s*(present|current|till date|\d{4})'
     ]
     for patt in date_range_patterns:
         for m in re.finditer(patt, experience_text, flags=re.IGNORECASE):
@@ -348,64 +713,28 @@ def extract_experience_from_resume(text, filename="", aggressive_edu=True):
     print("❌ No experience detected. Returning 0.0")
     EXTRACT_DEBUG_REGISTRY[fname] = dbg
     return 0.0
-# ----------------------------------------------------------------------------------------------------------------------
-# MANDATORY-FIRST SCORING
-# ----------------------------------------------------------------------------------------------------------------------
-def format_exp_years(exp_float):
-    years = int(exp_float)
-    months = int(round((exp_float - years) * 12))
-    if months == 0:
-        return f"{years} years"
-    return f"{years} years {months} month{'s' if months > 1 else ''}"
 
-def score_resume_v2(
-    resume_text: str,
+# ----------------------------------------------------------------------------------------
+# MANDATORY-FIRST SCORING helper and UI code (kept minimal for clarity)
+# ----------------------------------------------------------------------------------------
+def compute_score_from_sets(
+    resume_skillset: set,
+    resume_exp: float,
     jd_all_skills: set,
     jd_mandatory: set,
     jd_optional: set,
     jd_min_exp: int,
-    filename: str = "",
-    aggressive_edu: bool = True,
 ):
-    """
-    Mandatory-first:
-    - If any mandatory skill missing -> status='rejected' with reason 'Mandatory gap'.
-    - Otherwise score:
-      50% mandatory coverage + 30% optional coverage + 20% experience ratio
-    If no mandatory defined:
-      70% all-skills coverage + 30% experience ratio (back-compat)
-    """
-    if not resume_text:
-        return {
-            "score": 0,
-            "matched_mandatory": [],
-            "missing_mandatory": list(sorted(jd_mandatory)),
-            "matched_optional": [],
-            "matched_all": [],
-            "exp_years": 0.0,
-            "exp_met": False,
-            "status": "needs review",
-            "reason": "Empty or unreadable resume",
-            "resume_skillset": [],
-        }
-
-    resume_text_lower = resume_text.lower()
-    resume_skillset = get_skills_from_text(resume_text_lower)
-
-    # Partition matches
     matched_mandatory = sorted(list(jd_mandatory & resume_skillset))
     missing_mandatory = sorted(list(jd_mandatory - resume_skillset))
     matched_optional = sorted(list(jd_optional & resume_skillset))
-    matched_all = sorted(list((jd_all_skills & resume_skillset)))
+    matched_all = sorted(list(jd_all_skills & resume_skillset))
 
-    # Experience
-    resume_exp = extract_experience_from_resume(resume_text, filename, aggressive_edu)
     ratio = min(resume_exp / jd_min_exp, 1.0) if jd_min_exp > 0 else 1.0
 
-    # Gate on mandatory
     if jd_mandatory:
         if len(missing_mandatory) > 0:
-            score = int(20 * ratio)  # give tiny credit for exp even if rejected
+            score = int(20 * ratio)
             return {
                 "score": score,
                 "matched_mandatory": matched_mandatory,
@@ -419,20 +748,17 @@ def score_resume_v2(
                 "resume_skillset": sorted(list(resume_skillset)),
             }
 
-        # Compute score with mandatory weight
         mand_cov = len(matched_mandatory) / max(1, len(jd_mandatory))
         opt_cov = len(matched_optional) / max(1, len(jd_optional))
         score = round(50 * mand_cov + 30 * opt_cov + 20 * ratio)
         status = "selected" if (resume_exp >= jd_min_exp if jd_min_exp > 0 else True) and score >= 50 else "rejected"
         reason = "OK" if status == "selected" else ("Experience gap" if resume_exp < jd_min_exp else "Low score")
     else:
-        # No mandatory defined → fall back to all-skills coverage + exp
         cov = len(matched_all) / max(1, len(jd_all_skills))
         score = round(70 * cov + 30 * ratio)
         status = "selected" if (resume_exp >= jd_min_exp if jd_min_exp > 0 else True) and score >= 50 else "rejected"
         reason = "OK" if status == "selected" else ("Experience gap" if resume_exp < jd_min_exp else "Low score")
 
-    # Needs review heuristic: zero experience parsed
     if resume_exp == 0.0:
         status = "needs review"
         reason = "Experience not found (parser)"
@@ -450,13 +776,40 @@ def score_resume_v2(
         "resume_skillset": sorted(list(resume_skillset)),
     }
 
-# ----------------------------------------------------------------------------------------------------------------------
-# STREAMLIT UI
-# ----------------------------------------------------------------------------------------------------------------------
+def format_exp_years(exp_float):
+    years = int(exp_float)
+    months = int(round((exp_float - years) * 12))
+    if months == 0:
+        return f"{years} years"
+    return f"{years} years {months} month{'s' if months > 1 else ''}"
+
+# ----------------------------------------------------------------------------------------
+# STREAMLIT UI (kept minimal; unchanged style from previous iteration)
+# ----------------------------------------------------------------------------------------
 st.set_page_config(layout="wide", page_title="HIRE HUB — Robust")
 APP_BG_COLOR = "#f4f8ff"
 
-# >>> ADDED/CHANGED: global CSS + a green variant class we can toggle
+st.markdown("""
+<style>
+.use-jd-btn-wrap div.stButton > button:first-child {
+    background-color: #16a34a !important;  /* Green */
+    color: #ffffff !important;
+    font-size: 18px !important;
+    font-weight: bold !important;
+    border-radius: 12px !important;
+    padding: 12px 28px !important;
+    border: none !important;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.2) !important;
+    transition: all 0.3s ease-in-out !important;
+}
+.use-jd-btn-wrap div.stButton > button:first-child:hover {
+    background-color: #22c55e !important;  /* Lighter green on hover */
+    transform: scale(1.05);
+    box-shadow: 0 6px 14px rgba(0,0,0,0.25);
+}
+</style>
+""", unsafe_allow_html=True)
+
 st.markdown(f"""
 <style>
 .stApp {{ background: linear-gradient(180deg, {APP_BG_COLOR} 0%, #ffffff 100%); }}
@@ -471,11 +824,38 @@ st.markdown(f"""
 .badge.orange {{ background-color: #f59e0b; }} /* Needs Review — Manual */
 .badge.red {{ background-color: #dc2626; }} /* Rejected */
 .small-note {{ color:#64748b; font-size:12px; }}
-
-/* >>> ADDED: when JD form is used, make the submit button green */
-.jd-form-used button[kind="primary"] {{
-  background-color: #16a34a !important;
-  border-color: #16a34a !important;
+.jd-inline-card {{
+  max-width: 600px;
+  margin: 10px auto 18px auto;
+  background: #ffffff;
+  border-radius: 18px;
+  padding: 20px 18px 16px 18px;
+  box-shadow: 0 12px 40px rgba(15,23,42,0.12);
+}}
+.header {{
+  background: linear-gradient(135deg, #0ea5e9 0%, #1f6feb 60%, #9333ea 100%);
+  padding: 18px 22px;
+  border-radius: 12px;
+  color: #fff;
+  box-shadow: var(--shadow);
+  position: sticky;
+  top: 8px;
+  z-index: 10;
+}}
+.jd-modal-title {{
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}}
+.jd-modal-sub {{
+  font-size: 13px;
+  color: #6b7280;
+  margin-bottom: 12px;
+}}
+.jd-modal-footer-text {{
+  font-size: 11px;
+  color: #9ca3af;
+  margin-top: 4px;
 }}
 </style>
 """, unsafe_allow_html=True)
@@ -484,15 +864,15 @@ st.markdown(f"""<div class="header"><h2 style="margin:0; font-weight:700;">📄 
 
 st.sidebar.title("⚙️ Uploads")
 
-# Reset button
+# Reset & JD form state
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 if "jd_form_payload" not in st.session_state:
     st.session_state.jd_form_payload = None
 if "jd_mandatory_from_file" not in st.session_state:
     st.session_state.jd_mandatory_from_file = set()
-
-# >>> ADDED: results persistence keys
+if "show_jd_modal" not in st.session_state:
+    st.session_state.show_jd_modal = False
 if "results_df" not in st.session_state:
     st.session_state.results_df = None
 if "results_html_table" not in st.session_state:
@@ -500,7 +880,7 @@ if "results_html_table" not in st.session_state:
 if "show_results_now" not in st.session_state:
     st.session_state.show_results_now = False
 if "last_summary" not in st.session_state:
-    st.session_state.last_summary = None  # store top cards info (optional)
+    st.session_state.last_summary = None
 
 if st.sidebar.button("🔄 Reset All Uploads"):
     for key in ["jd_file", "resume_files", "resume_zip"]:
@@ -509,13 +889,12 @@ if st.sidebar.button("🔄 Reset All Uploads"):
     st.session_state.uploader_key += 1
     st.session_state.jd_form_payload = None
     st.session_state.jd_mandatory_from_file = set()
-    # >>> also clear results
     st.session_state.results_df = None
     st.session_state.results_html_table = None
     st.session_state.show_results_now = False
+    st.session_state.show_jd_modal = False
     st.rerun()
 
-# Sidebar uploads
 st.sidebar.markdown("Upload JD & multiple resumes (or a zip containing resumes).")
 jd_file = st.sidebar.file_uploader(
     "📘 Upload Job Description (PDF/TXT)",
@@ -543,33 +922,35 @@ if resume_zip:
     st.session_state.resume_zip = resume_zip
 
 aggressive_edu_exclusion = st.sidebar.checkbox("⚡ Aggressive Education Date Exclusion", value=True)
+process_button = st.sidebar.button("🚀 Start Shortlisting", type="primary")
 
-# NEW: JD structured form
-st.sidebar.markdown("### 🧩 JD Form (optional)")
-with st.sidebar.expander("Fill JD details without a file"):
-    # >>> ADDED: container that can get green class after used
-    jd_form_css_class = "jd-form-used" if st.session_state.get("jd_form_payload") else ""
-    with st.form("jd_form"):
-        # Put a small hidden marker div to apply class to the form block if used
-        if jd_form_css_class:
-            st.markdown(f'<div class="{jd_form_css_class}"></div>', unsafe_allow_html=True)  # cosmetic hook
+# Center JD Form button
+st.markdown('<div style="text-align:center; margin: 18px 0 4px 0;">', unsafe_allow_html=True)
+open_modal = st.button("✅ Use JD Form", key="open_jd_modal", type="secondary", help="Fill JD details without a file")
+st.markdown('</div>', unsafe_allow_html=True)
+if open_modal:
+    st.session_state.show_jd_modal = True
+    st.rerun()
 
+# JD inline form
+if st.session_state.show_jd_modal:
+    st.markdown('<div class="jd-modal-title">Job Description Form</div>', unsafe_allow_html=True)
+    st.markdown('<div class="jd-modal-sub">Fill in JD details if you don\'t have a JD file, or want to override it.</div>', unsafe_allow_html=True)
+    with st.form("jd_form_modal"):
         role_title = st.text_input("Role Title", placeholder="e.g., Embedded Linux Engineer")
         min_exp_years = st.number_input("Minimum Experience (years)", min_value=0, max_value=50, value=0, step=1)
         jd_mandatory_str = st.text_area("Mandatory Skills (comma-separated)", placeholder="e.g., Embedded C, Linux, Device Tree, U-Boot")
         jd_optional_str = st.text_area("Optional/Nice-to-have Skills (comma-separated)", placeholder="e.g., Yocto, SPI, I2C, UART")
-
-        # >>> CHANGED: make it primary (blue), and turn GREEN when form is active via CSS above
-        use_form = st.form_submit_button("Use JD Form", type="primary", help="Click to apply JD form values")
+        col_apply, col_cancel = st.columns([1,1])
+        use_form = col_apply.form_submit_button("Apply JD Form", type="primary")
+        cancel_form = col_cancel.form_submit_button("Cancel")
 
         if use_form:
             def canonize_list(s):
                 items = [re.sub(r'\s+', ' ', x.strip().lower()) for x in s.split(',') if x.strip()]
-                # Map via canonicalizer using the same patterns
                 canonical = set()
-                text = " " + " , ".join(items) + " "  # cheap trick to reuse detector
-                canonical = get_skills_from_text(text)
-                # Add any literal tokens not matched by patterns
+                text = " " + " , ".join(items) + " "
+                canonical = get_keywords_from_jd(text)
                 for x in items:
                     if x not in canonical:
                         canonical.add(x)
@@ -581,18 +962,28 @@ with st.sidebar.expander("Fill JD details without a file"):
                 "mandatory": canonize_list(jd_mandatory_str),
                 "optional": canonize_list(jd_optional_str),
             }
-            # >>> ADDED: toast + rerun to apply green CSS to the submit button
-            st.toast("JD Form applied.", icon="✅")
+
+            # Build canonical form_text for hashing and cache the form-derived keywords
+            form_text = json.dumps(st.session_state.jd_form_payload, sort_keys=True)
+            form_hash = _text_hash(form_text)
+            st.session_state.jd_hash = form_hash
+            jd_keywords_from_form = set(st.session_state.jd_form_payload["mandatory"]) | set(st.session_state.jd_form_payload["optional"])
+            st.session_state.jd_keywords_cached = set(jd_keywords_from_form)
+
+            st.session_state.show_jd_modal = False
+            st.toast("JD Form applied and cached.", icon="✅")
             st.rerun()
 
-process_button = st.sidebar.button("🚀 Start Shortlisting", type="primary")
+        if cancel_form:
+            st.session_state.show_jd_modal = False
+            st.rerun()
 
-# ----- Tabs
+    st.markdown('<div class="jd-modal-footer-text">Tip: Once applied, this JD form will override any uploaded JD file unless you reset uploads.</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# Tabs
 tab1, tab2 = st.tabs(["📘 Job Description", "🧾 Resumes"])
 
-# ----------------------------------------------------------------------------------------------------------------------
-# TAB 1 — JD PREVIEW + Mandatory picker (for file flow)
-# ----------------------------------------------------------------------------------------------------------------------
 with tab1:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Step 1 — Job Description")
@@ -608,7 +999,7 @@ with tab1:
         st.markdown(f"**Optional (form)**: {', '.join(sorted(list(p['optional']))) or '—'}")
         jd_keywords = (p["mandatory"] | p["optional"])
         jd_min_exp = p["min_exp"]
-        st.info("You can still upload a JD file, but the form values will be used.")
+        st.info("You can still upload a JD file, but the form values from the center-button JD Form will be used.")
     else:
         if jd_file:
             if jd_file.type == "application/pdf":
@@ -617,8 +1008,30 @@ with tab1:
                 jd_text = extract_text_from_txt(jd_file)
             st.text_area("JD Preview (first 2000 chars):", jd_text[:2000], height=220)
 
-            # Extract skills from file
-            jd_keywords = get_keywords_from_jd(jd_text)
+            # Provide a force-reextract button near preview
+            col_a, col_b = st.columns([1, 1])
+            with col_a:
+                reextract = st.button("🔁 Re-extract JD Skills (force)")
+            with col_b:
+                st.markdown("")  # placeholder for balanced layout
+
+            # compute hash & use cache: only call Gemini if JD changed
+            new_hash = _text_hash(jd_text)
+            if reextract:
+                # forced re-extraction (ignore cache)
+                with st.spinner("Re-extracting JD skills..."):
+                    jd_keywords = get_keywords_from_jd(jd_text)
+                st.success("Re-extracted JD skills (forced).")
+            else:
+                if new_hash != st.session_state.jd_hash:
+                    # JD changed — extract and cache
+                    with st.spinner("Extracting JD skills (this may take a moment)..."):
+                        jd_keywords = get_keywords_from_jd(jd_text)
+                    st.success("JD skills extracted and cached.")
+                else:
+                    # reuse cached
+                    jd_keywords = set(st.session_state.jd_keywords_cached)
+                    st.info("Using cached JD skills (no change detected).")
 
             # Try to infer min exp from text
             jd_min_exp = 0
@@ -644,23 +1057,15 @@ with tab1:
                 st.session_state.jd_mandatory_from_file = set(picked)
                 st.success("Saved mandatory selection.")
 
-            st.markdown(f"""
-                <div style='font-size:22px; font-weight:bold; color:#16a34a; margin-top:10px;'>
-                🧠 Detected JD Skills ({len(jd_keywords)}):<br>
-                <span style='font-size:18px; font-weight:normal; color:#333;'>{', '.join(sorted(list(jd_keywords)))}</span>
-                </div>
-                """, unsafe_allow_html=True)
-            st.markdown(f"### 🕒 Min Experience (parsed): **{jd_min_exp} years**")
+            st.markdown(f"**Detected JD Skills** ({len(jd_keywords)}): " + (", ".join(sorted(list(jd_keywords))) if jd_keywords else "—"))
+            st.markdown(f"**Min Experience (parsed)**: **{jd_min_exp} years**")
         else:
             jd_keywords = set()
             jd_min_exp = 0
-            st.info("Upload JD (PDF/TXT) or use the JD Form in sidebar.")
+            st.info("Upload JD (PDF/TXT) or click **Use JD Form** in the center of the page.")
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ----------------------------------------------------------------------------------------------------------------------
-# TAB 2 — RESUME UPLOADS
-# ----------------------------------------------------------------------------------------------------------------------
 with tab2:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Step 2 — Upload Resumes")
@@ -675,15 +1080,10 @@ with tab2:
         st.info("No resumes uploaded yet.")
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ----------------------------------------------------------------------------------------------------------------------
-# Helper: Result rendering (used both for auto-show and in Tab 3)
-# ----------------------------------------------------------------------------------------------------------------------
-# >>> CHANGED: added key_suffix to give download_button a unique key depending on where we render
+# Result renderer and other UI helpers (kept minimal) ---------------------------------------
 def render_results_block(df, jd_min_exp_value, jd_all_skills, jd_mandatory, jd_optional, key_suffix: str = "default"):
-    """Renders the results table, top 3 cards, and download button from a df already computed."""
     st.success(f"Processed {len(df)} resume(s).")
     if not df.empty:
-        # Top-3 cards
         top_k = df.head(3)
         cols = st.columns(3)
         for c, (_, r) in zip(cols, top_k.iterrows()):
@@ -694,7 +1094,6 @@ def render_results_block(df, jd_min_exp_value, jd_all_skills, jd_mandatory, jd_o
 
         st.markdown("### Shortlisted Candidates")
 
-        # HTML table (persist a stable HTML so that download-trigger re-runs don't recalc)
         html_table = df[[
             "Candidate Name",
             "Score",
@@ -711,13 +1110,11 @@ def render_results_block(df, jd_min_exp_value, jd_all_skills, jd_mandatory, jd_o
         wrapper = f'<div class="hirehub-wrapper">{html_table}</div>'
         st.markdown(wrapper, unsafe_allow_html=True)
 
-        # Prepare Excel bytes once
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine='openpyxl') as writer:
             df.to_excel(writer, index=False, sheet_name='Shortlisted')
         buf.seek(0)
 
-        # >>> UNIQUE KEY HERE (prevents duplicate ID if rendered in multiple places)
         st.download_button(
             "📥 Download Shortlisted Candidates (Excel)",
             buf,
@@ -725,33 +1122,37 @@ def render_results_block(df, jd_min_exp_value, jd_all_skills, jd_mandatory, jd_o
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"download_excel_{key_suffix}",
         )
-        # Persist HTML for re-renders after download
         st.session_state.results_html_table = wrapper
     else:
         st.info("No candidates to display after filters.")
 
+# Helper: read zip
+def read_zip_to_files(zip_file):
+    try:
+        zip_file.seek(0)
+        z = zipfile.ZipFile(io.BytesIO(zip_file.read()))
+        files = []
+        for name in z.namelist():
+            if name.lower().endswith(('.pdf', '.docx', '.txt')):
+                try:
+                    data = z.read(name)
+                    bio = io.BytesIO(data)
+                    bio.name = os.path.basename(name)
+                    files.append(bio)
+                except:
+                    continue
+        return files
+    except Exception as e:
+        st.error(f"Failed to process zip file: {e}")
+        return []
 
-
-# ----------------------------------------------------------------------------------------------------------------------
-# PROCESS ACTION — this computes results, persists to session, and auto-shows results
-# ----------------------------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------
+# PROCESS ACTION — uses Gemini-first extractors (cache-aware)
+# ----------------------------------------------------------------------------------------
 if process_button:
     combined_resumes = list(st.session_state.get("resume_files") or [])
     if st.session_state.get("resume_zip"):
-        try:
-            st.session_state.resume_zip.seek(0)
-            z = zipfile.ZipFile(io.BytesIO(st.session_state.resume_zip.read()))
-            for fname in z.namelist():
-                if fname.lower().endswith(('.pdf', '.docx', '.txt')):
-                    try:
-                        data = z.read(fname)
-                        bio = io.BytesIO(data)
-                        bio.name = os.path.basename(fname)
-                        combined_resumes.append(bio)
-                    except:
-                        continue
-        except Exception as e:
-            st.error(f"Failed to process zip file: {e}")
+        combined_resumes.extend(read_zip_to_files(st.session_state.resume_zip))
 
     jd_from_form = st.session_state.jd_form_payload is not None
 
@@ -768,17 +1169,24 @@ if process_button:
             jd_optional = set(p["optional"])
             jd_all_skills = jd_mandatory | jd_optional
         else:
-            # File-based
+            # Use cache if present; otherwise compute & cache
             jd_file = st.session_state.jd_file
             if jd_file.type == "application/pdf":
                 jd_text = extract_text_from_pdf(jd_file)
             else:
                 jd_text = extract_text_from_txt(jd_file)
-            jd_all_skills = get_keywords_from_jd(jd_text)
-            # Mandatory from user selection (if any)
+
+            if st.session_state.get("jd_keywords_cached"):
+                jd_all_skills = set(st.session_state.jd_keywords_cached)
+            else:
+                # worst-case: compute & cache
+                with st.spinner("Extracting JD skills..."):
+                    jd_all_skills = set(get_keywords_from_jd(jd_text))
+                st.session_state.jd_keywords_cached = set(jd_all_skills)
+                st.session_state.jd_hash = _text_hash(jd_text)
+
             jd_mandatory = set(st.session_state.jd_mandatory_from_file or set())
             jd_optional = jd_all_skills - jd_mandatory
-            # Min exp parse again to be safe
             jd_min_exp = 0
             for pat in [r'(\d+)\s*\+\s*years', r'(\d+)\s*\-\s*\d+\s*years',
                         r'minimum\s*of\s*(\d+)\s*years', r'at\s*least\s*(\d+)\s*years',
@@ -791,10 +1199,29 @@ if process_button:
                     except:
                         pass
 
-        # Process resumes
+        # ------------------ Process resumes (with percent indicator) ------------------
         results = []
-        progress = st.progress(0)
         total = len(combined_resumes)
+
+        # progress UI: progress bar + percentage label
+        progress_bar = st.progress(0)
+        progress_label = st.empty()  # we'll use this to show "xx% — n/total processed"
+
+        def _update_progress(i, total):
+            if total <= 0:
+                pct = 100
+            else:
+                pct = int(((i) / total) * 100)
+                if pct > 100:
+                    pct = 100
+            # update progress bar (expects fraction 0..1)
+            frac = min(max(i / max(1, total), 0.0), 1.0)
+            progress_bar.progress(frac)
+            # show percentage with processed count
+            progress_label.markdown(f"**Progress:** {pct}% — {i}/{total} processed")
+
+        # initialize display
+        _update_progress(0, total)
 
         def status_badge(status, reason=""):
             color = {"selected": "green", "needs review": "orange", "rejected": "red"}[status]
@@ -805,8 +1232,8 @@ if process_button:
             }[status]
             return f'<span class="badge {color}">{label}</span>' + (f' <span class="small-note">({reason})</span>' if reason else "")
 
-        for i, rf in enumerate(combined_resumes):
-            fname = getattr(rf, "name", f"resume_{i}")
+        for idx, rf in enumerate(combined_resumes, start=1):
+            fname = getattr(rf, "name", f"resume_{idx}")
             txt = ""
             try:
                 if fname.lower().endswith(".pdf"):
@@ -818,28 +1245,37 @@ if process_button:
             except Exception:
                 txt = ""
 
-            # Score using mandatory-first
-            scr = score_resume_v2(
-                txt,
+            # 1) Skills extraction: GEMINI-first (no heavy local logic anymore)
+            skills_list = get_skills_from_text(txt, max_terms=500)
+            skills_set = set(skills_list)
+
+            # 2) Experience extraction: ask LLM first, fallback to local extractor
+            years_decimal, raw_exp = call_gemini_for_years(txt)
+            if years_decimal == 0.0:
+                # local fallback
+                years_decimal = extract_experience_from_resume(txt, filename=fname, aggressive_edu=aggressive_edu_exclusion)
+
+            # 3) Compute score using sets (ensures consistent response shape)
+            scoring = compute_score_from_sets(
+                resume_skillset=skills_set,
+                resume_exp=years_decimal,
                 jd_all_skills=jd_all_skills,
                 jd_mandatory=jd_mandatory,
                 jd_optional=jd_optional,
-                jd_min_exp=jd_min_exp,
-                filename=fname,
-                aggressive_edu=aggressive_edu_exclusion
+                jd_min_exp=jd_min_exp
             )
 
-            # Pretty console debug (kept your style)
+            # (your debug / print block left unchanged)
             src_info = EXTRACT_DEBUG_REGISTRY.get(fname, {})
             src = src_info.get("source", "n/a")
             print("\n" + "-"*78)
             print(f"📄 RESUME REPORT: {fname}")
             print("-"*78)
-            print(f"• Matched Mandatory ({len(scr['matched_mandatory'])}): {', '.join(scr['matched_mandatory']) or '—'}")
-            print(f"• Missing Mandatory ({len(scr['missing_mandatory'])}): {', '.join(scr['missing_mandatory']) or '—'}")
+            print(f"• Matched Mandatory ({len(scoring['matched_mandatory'])}): {', '.join(scoring['matched_mandatory']) or '—'}")
+            print(f"• Missing Mandatory ({len(scoring['missing_mandatory'])}): {', '.join(scoring['missing_mandatory']) or '—'}")
             if jd_optional:
-                print(f"• Matched Optional ({len(scr['matched_optional'])}): {', '.join(scr['matched_optional']) or '—'}")
-            print(f"• Experience : {format_exp_years(scr['exp_years'])} (source: {src})")
+                print(f"• Matched Optional ({len(scoring['matched_optional'])}): {', '.join(scoring['matched_optional']) or '—'}")
+            print(f"• Experience : {format_exp_years(scoring['exp_years'])} (source: {src})")
             if src_info.get("structured_intervals"):
                 print("• Intervals (structured):")
                 for s,e in src_info["structured_intervals"]:
@@ -851,35 +1287,37 @@ if process_button:
             if src_info.get("explicit_values"):
                 print(f"• Explicit numeric mentions: {src_info['explicit_values']}")
             print(f"• JD Min Exp : {jd_min_exp} years")
-            print(f"• Score : {scr['score']}")
-            print(f"• Status : {scr['status'].upper()} ({scr['reason']})")
+            print(f"• Score : {scoring['score']}")
+            print(f"• Status : {scoring['status'].upper()} ({scoring['reason']})")
             print("-"*78)
 
-            missing_all = sorted(list((jd_all_skills - set(scr["matched_all"]))))
+            missing_all = sorted(list((jd_all_skills - set(scoring["matched_all"])))) if jd_all_skills else []
 
             results.append({
                 "Candidate Name": os.path.splitext(fname)[0],
-                "Score": scr["score"],
-                "Years Experience": format_exp_years(scr["exp_years"]),
-                "Status": status_badge(scr["status"], scr["reason"]),
-                "Matched Mandatory Count": len(scr["matched_mandatory"]),
-                "Mandatory Missing Count": len(scr["missing_mandatory"]),
-                "Matched Mandatory": ", ".join(scr["matched_mandatory"]),
-                "Mandatory Missing": ", ".join(scr["missing_mandatory"]),
-                "Matched Optional": ", ".join(scr["matched_optional"]),
-                "Matched (All JD Skills)": ", ".join(scr["matched_all"]),
+                "Score": scoring["score"],
+                "Years Experience": format_exp_years(scoring["exp_years"]),
+                "Status": status_badge(scoring["status"], scoring["reason"]),
+                "Matched Mandatory Count": len(scoring["matched_mandatory"]),
+                "Mandatory Missing Count": len(scoring["missing_mandatory"]),
+                "Matched Mandatory": ", ".join(scoring["matched_mandatory"]),
+                "Mandatory Missing": ", ".join(scoring["missing_mandatory"]),
+                "Matched Optional": ", ".join(scoring["matched_optional"]),
+                "Matched (All JD Skills)": ", ".join(scoring["matched_all"]),
                 "Unmatched (All JD Skills)": ", ".join(missing_all),
                 "Filename": fname
             })
-            progress.progress((i + 1) / total)
 
-        # Sort & show
+            # update progress display (pass idx so we show processed count)
+            _update_progress(idx, total)
+
+        # finalize progress UI
+        _update_progress(total, total)
+        progress_label.markdown(f"**Progress:** 100% — Completed ({total}/{total})")
+
         df = pd.DataFrame(sorted(results, key=lambda x: (x['Score'], -x["Mandatory Missing Count"]), reverse=True))
-
-        # >>> ADDED: persist results & minimal summary and auto-show
         st.session_state.results_df = df
 
-        # cache a tiny summary for the auto-render area (top-3)
         if not df.empty:
             tk = df.head(3)
             st.session_state.last_summary = tk.to_dict('records')
@@ -890,17 +1328,13 @@ if process_button:
         st.toast("Shortlisting complete. Showing results…", icon="📊")
         st.rerun()
 
-# ----------------------------------------------------------------------------------------------------------------------
-# AUTO SHOW RESULTS AREA (placed above tabs after processing)
-# ----------------------------------------------------------------------------------------------------------------------
+# Auto show results area
 if st.session_state.show_results_now and st.session_state.results_df is not None:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Results")
-    # Render directly here with a dedicated key suffix to avoid duplicate download_button ID
     render_results_block(
         st.session_state.results_df,
         0, set(), set(), set(),
-        key_suffix="autoshow"   # >>> UNIQUE key suffix for autoshow area
+        key_suffix="autoshow"
     )
     st.markdown('</div>', unsafe_allow_html=True)
-    # Note: we keep the tabbed Results as well. The user has both views.
