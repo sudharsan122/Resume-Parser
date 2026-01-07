@@ -915,79 +915,84 @@ def format_exp_years(exp_float):
 # ----------------------------------------------------------------------------------------------------------------------
 # STREAMLIT UI 
 # ----------------------------------------------------------------------------------------------------------------------
-import base64
-import os
 
-# ---------- Page config ----------
-st.set_page_config(
-    page_title="Capgemini – Resume Shortlisting",
-    page_icon="💼",
-    layout="wide",                      # full-width layout
-    initial_sidebar_state="expanded"    # or 'collapsed' as you prefer
-)
 
-# ---------- Helper: load logo as base64 ----------
-def img_to_base64(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
+st.set_page_config(page_title="HIRE HUB – Resume Shortlisting", page_icon="💼", layout="wide")
 
-LOGO_PATH = "assets/capgemini_logo.png"
-logo_b64 = img_to_base64(LOGO_PATH) if os.path.exists(LOGO_PATH) else ""
+APP_BG_COLOR = "#f4f8ff"
 
-# ---------- Global CSS: tighten main padding + header styling ----------
 st.markdown("""
 <style>
-    /* Reduce Streamlit's default left/right padding on the main container */
-    .block-container {
-        padding-top: 0.8rem;    /* default ~2rem; reduce it */
-        padding-left: 1.0rem;   /* tighten left padding to remove the big gap */
-        padding-right: 1.0rem;  /* keep symmetry */
-        max-width: 1200px;      /* keep content nicely centered (adjust if needed) */
-    }
-
-    /* Optional: make the header sticky when scrolling */
-    .app-header {
-        position: sticky;
-        top: 0;
-        z-index: 999;
-        background: #ffffff;           /* change to #F7F9FC or brand color if you want a banner */
-        border-bottom: 1px solid #eee; /* subtle divider */
-        padding: 12px 0;
-        display: flex;
-        align-items: center;
-        gap: 12px;
-    }
-
-    /* Logo sizing */
-    .app-header img {
-        height: 90px;                  /* adjust logo height here */
-        display: block;
-    }
-
-    /* Title styling */
-    .app-header h2 {
-        margin: 0;
-        font-weight: 800;
-        font-size: 2.5rem;            /* adjust size to taste */
-        color: #212121;
-    }
-
-    /* Responsive tweaks */
-    @media (max-width: 768px) {
-        .block-container { padding-left: 0.8rem; padding-right: 0.8rem; }
-        .app-header img { height: 24px; }
-        .app-header h2 { font-size: 1.1rem; }
-    }
+.use-jd-btn-wrap div.stButton > button:first-child {
+    background-color: #16a34a !important;  /* Green */
+    color: #ffffff !important;
+    font-size: 18px !important;
+    font-weight: bold !important;
+    border-radius: 12px !important;
+    padding: 12px 28px !important;
+    border: none !important;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.2) !important;
+    transition: all 0.3s ease-in-out !important;
+}
+.use-jd-btn-wrap div.stButton > button:first-child:hover {
+    background-color: #22c55e !important;  /* Lighter green on hover */
+    transform: scale(1.05);
+    box-shadow: 0 6px 14px rgba(0,0,0,0.25);
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Header block ----------
 st.markdown(f"""
-<div class="app-header">
-    {'<img src="data:image/png;base64,' + logo_b64 + '" alt="Capgemini logo">' if logo_b64 else ''}
-    <h2>📄 HIRE HUB — Resume Shortlister</h2>
-</div>
+<style>
+.stApp {{ background: linear-gradient(180deg, {APP_BG_COLOR} 0%, #ffffff 100%); }}
+.header {{ background: #007acc; padding: 18px; border-radius: 12px; color: white; }}
+.card {{ background: white; border-radius: 12px; padding: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.06); margin-bottom:12px; }}
+.hirehub-table {{ border-collapse: collapse; width: 100%; table-layout: auto; font-family: Arial, sans-serif; font-size: 13px; }}
+.hirehub-table th, .hirehub-table td {{ border: 1px solid #e2e8f0; padding: 8px; vertical-align: top; text-align: left; white-space: normal; }}
+.hirehub-table th {{ background: #f1f5f9; font-weight: 600; }}
+.hirehub-wrapper {{ overflow-x: auto; width: 100%; }}
+.badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; color: white; }}
+.badge.green {{ background-color: #16a34a; }} /* Selected */
+.badge.orange {{ background-color: #f59e0b; }} /* Needs Review — Manual */
+.badge.red {{ background-color: #dc2626; }} /* Rejected */
+.small-note {{ color:#64748b; font-size:12px; }}
+.jd-inline-card {{
+  max-width: 600px;
+  margin: 10px auto 18px auto;
+  background: #ffffff;
+  border-radius: 18px;
+  padding: 20px 18px 16px 18px;
+  box-shadow: 0 12px 40px rgba(15,23,42,0.12);
+}}
+.header {{
+  background: linear-gradient(135deg, #0ea5e9 0%, #1f6feb 60%, #9333ea 100%);
+  padding: 18px 22px;
+  border-radius: 12px;
+  color: #fff;
+  box-shadow: var(--shadow);
+  position: sticky;
+  top: 8px;
+  z-index: 10;
+}}
+.jd-modal-title {{
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}}
+.jd-modal-sub {{
+  font-size: 13px;
+  color: #6b7280;
+  margin-bottom: 12px;
+}}
+.jd-modal-footer-text {{
+  font-size: 11px;
+  color: #9ca3af;
+  margin-top: 4px;
+}}
+</style>
 """, unsafe_allow_html=True)
+
+st.markdown(f"""<div class="header"><h2 style="margin:0; font-weight:700;">📄 HIRE HUB — Resume Shortlister</h2></div>""", unsafe_allow_html=True)
 
 st.sidebar.title("⚙️ Uploads")
 
