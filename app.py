@@ -1,4 +1,3 @@
-#without LOGO
 # app.py  (your Streamlit app with integrated Gemini skill+experience extraction)
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -9,15 +8,15 @@ import re
 import docx
 import pdfplumber
 import zipfile
-import streamlit as st
 import pandas as pd
 import time
 import json
 from datetime import datetime
+# from word2number import w2n # REMOVED: unused
+import streamlit as st
 
 # ------------------ HARD-CODED GEMINI KEY (replace locally) ------------------
-
-GEMINI_API_KEY = "AIzaSyAVf_3yIxaO9ecFyWp7SIdbmgf4YnXGer8"
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 
 # ------------------ genai client ------------------
 try:
@@ -219,7 +218,13 @@ def extract_text_from_txt(txt_file):
     except Exception:
         return ""
 
+import re
+
+import re
+
 # ------------------ Hardened Skill extraction (drop-in replacement, with technical-signal guard) ------------------
+
+import re
 
 BASE_KEYWORDS = [
     "c", "c++", "c#", "python", "java", "javascript", "typescript", "go", "rust", "ruby", "php", "scala", "kotlin", "swift", "r",
@@ -843,6 +848,7 @@ def extract_experience_from_resume(text, filename="", aggressive_edu=True):
 # ----------------------------------------------------------------------------------------------------------------------
 # MANDATORY-FIRST SCORING helper that accepts resume_skillset and resume_exp directly
 # ----------------------------------------------------------------------------------------------------------------------
+
 def compute_score_from_sets(
     resume_skillset: set,
     resume_exp: float,
@@ -857,10 +863,17 @@ def compute_score_from_sets(
     matched_all = sorted(list(jd_all_skills & resume_skillset))
 
     ratio = min(resume_exp / jd_min_exp, 1.0) if jd_min_exp > 0 else 1.0
+    exp_met = resume_exp >= jd_min_exp if jd_min_exp > 0 else True
 
     if jd_mandatory:
+        # Existing mandatory-skills flow (unchanged)
         if len(missing_mandatory) > 0:
             score = int(20 * ratio)
+            status = "rejected"
+            reason = "Mandatory skills missing"
+            if resume_exp == 0.0:
+                status = "needs review"
+                reason = "Experience not found (parser)"
             return {
                 "score": score,
                 "matched_mandatory": matched_mandatory,
@@ -868,23 +881,34 @@ def compute_score_from_sets(
                 "matched_optional": matched_optional,
                 "matched_all": matched_all,
                 "exp_years": round(resume_exp, 1),
-                "exp_met": resume_exp >= jd_min_exp if jd_min_exp > 0 else True,
-                "status": "rejected",
-                "reason": "Mandatory skills missing",
+                "exp_met": exp_met,
+                "status": status,
+                "reason": reason,
                 "resume_skillset": sorted(list(resume_skillset)),
             }
 
         mand_cov = len(matched_mandatory) / max(1, len(jd_mandatory))
         opt_cov = len(matched_optional) / max(1, len(jd_optional))
         score = round(50 * mand_cov + 30 * opt_cov + 20 * ratio)
-        status = "selected" if (resume_exp >= jd_min_exp if jd_min_exp > 0 else True) and score >= 50 else "rejected"
-        reason = "OK" if status == "selected" else ("Experience gap" if resume_exp < jd_min_exp else "Low score")
-    else:
-        cov = len(matched_all) / max(1, len(jd_all_skills))
-        score = round(70 * cov + 30 * ratio)
-        status = "selected" if (resume_exp >= jd_min_exp if jd_min_exp > 0 else True) and score >= 50 else "rejected"
-        reason = "OK" if status == "selected" else ("Experience gap" if resume_exp < jd_min_exp else "Low score")
 
+        status = "selected" if exp_met and score >= 40 else "rejected"
+        reason = "OK" if status == "selected" else ("Experience gap" if not exp_met else "Low score")
+
+    else:
+        # No mandatory skills in JD:
+        # New rule: If experience is met and overall skill coverage >= 50%, select.
+        cov = len(matched_all) / max(1, len(jd_all_skills))
+        score = round(50 * cov + 50 * ratio)
+
+        if exp_met and cov >= 0.5:
+            status = "selected"
+            reason = "OK"
+        else:
+            # Fall back to previous score logic
+            status = "selected" if exp_met and score >= 40 else "rejected"
+            reason = "OK" if status == "selected" else ("Experience gap" if not exp_met else "Low score")
+
+    # Preserve special handling for parser-missed experience
     if resume_exp == 0.0:
         status = "needs review"
         reason = "Experience not found (parser)"
@@ -896,14 +920,14 @@ def compute_score_from_sets(
         "matched_optional": matched_optional,
         "matched_all": matched_all,
         "exp_years": round(resume_exp, 1),
-        "exp_met": resume_exp >= jd_min_exp if jd_min_exp > 0 else True,
+        "exp_met": exp_met,
         "status": status,
         "reason": reason,
         "resume_skillset": sorted(list(resume_skillset)),
     }
 
 # ----------------------------------------------------------------------------------------------------------------------
-# Helper: format experience string
+# Helper: format experience string (same as before)
 # ----------------------------------------------------------------------------------------------------------------------
 def format_exp_years(exp_float):
     years = int(exp_float)
@@ -913,12 +937,9 @@ def format_exp_years(exp_float):
     return f"{years} years {months} month{'s' if months > 1 else ''}"
 
 # ----------------------------------------------------------------------------------------------------------------------
-# STREAMLIT UI 
+# STREAMLIT UI (mostly unchanged — only processing loop uses LLM functions now)
 # ----------------------------------------------------------------------------------------------------------------------
-
-
-st.set_page_config(page_title="HIRE HUB – Resume Shortlisting", page_icon="💼", layout="wide")
-
+st.set_page_config(layout="wide", page_title="HIRE HUB — Robust")
 APP_BG_COLOR = "#f4f8ff"
 
 st.markdown("""
@@ -1036,27 +1057,24 @@ jd_file = st.sidebar.file_uploader(
 if jd_file:
     st.session_state.jd_file = jd_file
 
-# ================== RESUME UPLOAD OPTIONS ==================
-st.sidebar.subheader("🧾 Upload Resumes")
-# Option 1: Multiple resume files OR folder drag-drop
 resume_files = st.sidebar.file_uploader(
-    "📂 Upload Resume Files or Drag Folder Here",
-    type=["pdf", "docx", "txt"],
+    "🧾 Upload Resumes (PDF/DOCX/TXT) — select multiple",
+    type=['pdf', 'docx', 'txt'],
     accept_multiple_files=True,
-    help="You can drag & drop an entire folder here (Chrome supported)"
+    key=f"resumes_{st.session_state.uploader_key}"
 )
 if resume_files:
     st.session_state.resume_files = resume_files
 
-# Option 2: ZIP upload (already exists)
 resume_zip = st.sidebar.file_uploader(
-    "🗜️ Upload Resume Folder as ZIP",
-    type=["zip"]
+    "📁 (Optional) Upload Resumes Folder (.zip)",
+    type=['zip'],
+    key=f"zip_{st.session_state.uploader_key}"
 )
 if resume_zip:
     st.session_state.resume_zip = resume_zip
 
-#aggressive_edu_exclusion = st.sidebar.checkbox("⚡ Aggressive Education Date Exclusion", value=True)
+aggressive_edu_exclusion = st.sidebar.checkbox("⚡ Aggressive Education Date Exclusion", value=True)
 process_button = st.sidebar.button("🚀 Start Shortlisting", type="primary")
 
 # Center JD Form button
@@ -1109,9 +1127,9 @@ if st.session_state.show_jd_modal:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # Tabs
-tab1, tab2, tab3 = st.tabs(["📊 Results", "📘 Job Description", "🧾 Resumes"])
+tab1, tab2 = st.tabs(["📘 Job Description", "🧾 Resumes"])
 
-with tab2:
+with tab1:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Step 1 — Job Description")
 
@@ -1171,7 +1189,7 @@ with tab2:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-with tab3:
+with tab2:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Step 2 — Upload Resumes")
     if st.session_state.get("resume_files"):
@@ -1185,259 +1203,257 @@ with tab3:
         st.info("No resumes uploaded yet.")
     st.markdown('</div>', unsafe_allow_html=True)
 
-with tab1:
 # Result renderer (unchanged)
-    def render_results_block(df, jd_min_exp_value, jd_all_skills, jd_mandatory, jd_optional, key_suffix: str = "default"):
-        st.success(f"Processed {len(df)} resume(s).")
-        if not df.empty:
-            top_k = df.head(3)
-            cols = st.columns(3)
-            for c, (_, r) in zip(cols, top_k.iterrows()):
-                c.markdown(f"**{r['Candidate Name']}**", unsafe_allow_html=True)
-                c.markdown(f"Score: **{r['Score']}** • Exp: **{r['Years Experience']}**", unsafe_allow_html=True)
-                c.markdown(r['Status'], unsafe_allow_html=True)
-                c.caption((r['Matched Mandatory'][:120] + ("..." if len(r['Matched Mandatory']) > 120 else "")) or "—")
+def render_results_block(df, jd_min_exp_value, jd_all_skills, jd_mandatory, jd_optional, key_suffix: str = "default"):
+    st.success(f"Processed {len(df)} resume(s).")
+    if not df.empty:
+        top_k = df.head(3)
+        cols = st.columns(3)
+        for c, (_, r) in zip(cols, top_k.iterrows()):
+            c.markdown(f"**{r['Candidate Name']}**", unsafe_allow_html=True)
+            c.markdown(f"Score: **{r['Score']}** • Exp: **{r['Years Experience']}**", unsafe_allow_html=True)
+            c.markdown(r['Status'], unsafe_allow_html=True)
+            c.caption((r['Matched Mandatory'][:120] + ("..." if len(r['Matched Mandatory']) > 120 else "")) or "—")
 
-            st.markdown("### Shortlisted Candidates")
+        st.markdown("### Shortlisted Candidates")
 
-            html_table = df[[
-                "Candidate Name",
-                "Score",
-                "Years Experience",
-                "Status",
-                "Matched Mandatory Count",
-                "Mandatory Missing Count",
-                "Matched Mandatory",
-                "Mandatory Missing",
-                "Matched Optional",
-                "Matched (All JD Skills)",
-                "Unmatched (All JD Skills)",
-            ]].to_html(index=False, escape=False, classes="hirehub-table")
-            wrapper = f'<div class="hirehub-wrapper">{html_table}</div>'
-            st.markdown(wrapper, unsafe_allow_html=True)
+        html_table = df[[
+            "Candidate Name",
+            "Score",
+            "Years Experience",
+            "Status",
+            "Matched Mandatory Count",
+            "Mandatory Missing Count",
+            "Matched Mandatory",
+            "Mandatory Missing",
+            "Matched Optional",
+            "Matched (All JD Skills)",
+            "Unmatched (All JD Skills)",
+        ]].to_html(index=False, escape=False, classes="hirehub-table")
+        wrapper = f'<div class="hirehub-wrapper">{html_table}</div>'
+        st.markdown(wrapper, unsafe_allow_html=True)
 
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='Shortlisted')
-            buf.seek(0)
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Shortlisted')
+        buf.seek(0)
 
-            st.download_button(
-                "📥 Download Shortlisted Candidates (Excel)",
-                buf,
-                file_name="shortlisted_candidates.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"download_excel_{key_suffix}",
-            )
-            st.session_state.results_html_table = wrapper
-        else:
-            st.info("No candidates to display after filters.")
-
-    # Helper: read zip
-    def read_zip_to_files(zip_file):
-        try:
-            zip_file.seek(0)
-            z = zipfile.ZipFile(io.BytesIO(zip_file.read()))
-            files = []
-            for name in z.namelist():
-                if name.lower().endswith(('.pdf', '.docx', '.txt')):
-                    try:
-                        data = z.read(name)
-                        bio = io.BytesIO(data)
-                        bio.name = os.path.basename(name)
-                        files.append(bio)
-                    except:
-                        continue
-            return files
-        except Exception as e:
-            st.error(f"Failed to process zip file: {e}")
-            return []
-
-    # ----------------------------------------------------------------------------------------------------------------------
-    # PROCESS ACTION — now using LLM-first flow with fallbacks to local extraction
-    # ----------------------------------------------------------------------------------------------------------------------
-    if process_button:
-        combined_resumes = list(st.session_state.get("resume_files") or [])
-        if st.session_state.get("resume_zip"):
-            combined_resumes.extend(read_zip_to_files(st.session_state.resume_zip))
-
-        jd_from_form = st.session_state.jd_form_payload is not None
-
-        if not (jd_from_form or st.session_state.get("jd_file")):
-            st.warning("Please provide a Job Description via Form or File.")
-        elif not combined_resumes:
-            st.warning("Please upload at least one resume (individual files or a zip).")
-        else:
-            # Resolve JD payload (same as before)
-            if jd_from_form:
-                p = st.session_state.jd_form_payload
-                jd_min_exp = p["min_exp"]
-                jd_mandatory = set(p["mandatory"])
-                jd_optional = set(p["optional"])
-                jd_all_skills = jd_mandatory | jd_optional
-            else:
-                jd_file = st.session_state.jd_file
-                if jd_file.type == "application/pdf":
-                    jd_text = extract_text_from_pdf(jd_file)
-                else:
-                    jd_text = extract_text_from_txt(jd_file)
-                jd_all_skills = get_keywords_from_jd(jd_text)
-                jd_mandatory = set(st.session_state.jd_mandatory_from_file or set())
-                jd_optional = jd_all_skills - jd_mandatory
-                jd_min_exp = 0
-                for pat in [r'(\d+)\s*\+\s*years', r'(\d+)\s*\-\s*\d+\s*years',
-                            r'minimum\s*of\s*(\d+)\s*years', r'at\s*least\s*(\d+)\s*years',
-                            r'(\d+)\s*years\s*of\s*experience']:
-                    found = re.findall(pat, jd_text)
-                    if found:
-                        try:
-                            jd_min_exp = int(found[0])
-                            break
-                        except:
-                            pass
-
-            # ------------------ Process resumes (with percent indicator) ------------------
-            
-            results = []
-            total = len(combined_resumes)
-
-            # progress UI: progress bar + percentage label
-            progress_bar = st.progress(0)
-            progress_label = st.empty()  # we'll use this to show "xx% — n/total processed"
-            def _update_progress(i, total):
-                if total <= 0:
-                    pct = 100
-                else:
-                    pct = int(((i) / total) * 100)
-                    if pct > 100:
-                        pct = 100
-                # update progress bar (expects fraction 0..1)
-                frac = min(max(i / max(1, total), 0.0), 1.0)
-                progress_bar.progress(frac)
-                # show percentage with processed count
-                progress_label.markdown(f"**Progress:** {pct}% — {i}/{total} processed")
-
-            # initialize display
-            _update_progress(0, total)
-
-            def status_badge(status, reason=""):
-                color = {"selected": "green", "needs review": "orange", "rejected": "red"}[status]
-                label = {
-                    "selected": "Selected",
-                    "rejected": "Rejected",
-                    "needs review": "Needs Review — Manual Check"
-                }[status]
-                return f'<span class="badge {color}">{label}</span>' + (f' <span class="small-note">({reason})</span>' if reason else "")
-
-            for idx, rf in enumerate(combined_resumes, start=1):
-                fname = getattr(rf, "name", f"resume_{idx}")
-                txt = ""
-                try:
-                    if fname.lower().endswith(".pdf"):
-                        txt = extract_text_from_pdf(rf)
-                    elif fname.lower().endswith(".docx"):
-                        txt = extract_text_from_docx(rf)
-                    else:
-                        txt = extract_text_from_txt(rf)
-                except Exception:
-                    txt = ""
-
-                # 1) Skills extraction: ask LLM first, fallback to local get_skills_from_text
-                skills_list, raw_sk = call_gemini_for_skills(txt)
-                if not skills_list:
-                    # fallback to local extractor
-                    local_skills = get_skills_from_text(txt)
-                    skills_set = set(local_skills)
-                else:
-                    skills_set = set(skills_list)
-
-                # 2) Experience extraction: ask LLM first, fallback to local extractor
-                years_decimal, raw_exp = call_gemini_for_years(txt)
-                if years_decimal == 0.0:
-                    # local fallback
-                    years_decimal = extract_experience_from_resume(txt, filename=fname)
-
-                # 3) Compute score using sets (ensures consistent response shape)
-                scoring = compute_score_from_sets(
-                    resume_skillset=skills_set,
-                    resume_exp=years_decimal,
-                    jd_all_skills=jd_all_skills,
-                    jd_mandatory=jd_mandatory,
-                    jd_optional=jd_optional,
-                    jd_min_exp=jd_min_exp
-                )
-
-                # (your debug / print block left unchanged)
-                src_info = EXTRACT_DEBUG_REGISTRY.get(fname, {})
-                src = src_info.get("source", "n/a")
-                print("\n" + "-"*78)
-                print(f"📄 RESUME REPORT: {fname}")
-                print("-"*78)
-                print(f"• Matched Mandatory ({len(scoring['matched_mandatory'])}): {', '.join(scoring['matched_mandatory']) or '—'}")
-                print(f"• Missing Mandatory ({len(scoring['missing_mandatory'])}): {', '.join(scoring['missing_mandatory']) or '—'}")
-                if jd_optional:
-                    print(f"• Matched Optional ({len(scoring['matched_optional'])}): {', '.join(scoring['matched_optional']) or '—'}")
-                print(f"• Experience : {format_exp_years(scoring['exp_years'])} (source: {src})")
-                if src_info.get("structured_intervals"):
-                    print("• Intervals (structured):")
-                    for s,e in src_info["structured_intervals"]:
-                        print(f" - {s} → {e}")
-                if src_info.get("date_range_intervals"):
-                    print("• Intervals (date ranges):")
-                    for s,e in src_info["date_range_intervals"]:
-                        print(f" - {s} → {e}")
-                if src_info.get("explicit_values"):
-                    print(f"• Explicit numeric mentions: {src_info['explicit_values']}")
-                print(f"• JD Min Exp : {jd_min_exp} years")
-                print(f"• Score : {scoring['score']}")
-                print(f"• Status : {scoring['status'].upper()} ({scoring['reason']})")
-                print("-"*78)
-
-                missing_all = sorted(list((jd_all_skills - set(scoring["matched_all"])))) if jd_all_skills else []
-
-                results.append({
-                    "Candidate Name": os.path.splitext(fname)[0],
-                    "Score": scoring["score"],
-                    "Years Experience": format_exp_years(scoring["exp_years"]),
-                    "Status": status_badge(scoring["status"], scoring["reason"]),
-                    "Matched Mandatory Count": len(scoring["matched_mandatory"]),
-                    "Mandatory Missing Count": len(scoring["missing_mandatory"]),
-                    "Matched Mandatory": ", ".join(scoring["matched_mandatory"]),
-                    "Mandatory Missing": ", ".join(scoring["missing_mandatory"]),
-                    "Matched Optional": ", ".join(scoring["matched_optional"]),
-                    "Matched (All JD Skills)": ", ".join(scoring["matched_all"]),
-                    "Unmatched (All JD Skills)": ", ".join(missing_all),
-                    "Filename": fname
-                })
-
-                # update progress display (pass idx so we show processed count)
-                _update_progress(idx, total)
-
-            # finalize progress UI
-            _update_progress(total, total)
-            progress_label.markdown(f"**Progress:** 100% — Completed ({total}/{total})")
-
-            df = pd.DataFrame(sorted(results, key=lambda x: (x['Score'], -x["Mandatory Missing Count"]), reverse=True))
-            st.session_state.results_df = df
-
-            if not df.empty:
-                tk = df.head(3)
-                st.session_state.last_summary = tk.to_dict('records')
-            else:
-                st.session_state.last_summary = None
-
-            
-            st.session_state.show_results_now = True
-            st.toast("Shortlisting complete. Showing results…", icon="📊")
-            st.rerun()
-            
-
-    # Auto show results area
-    if st.session_state.show_results_now and st.session_state.results_df is not None:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("Results")
-        render_results_block(
-            st.session_state.results_df,
-            0, set(), set(), set(),
-            key_suffix="autoshow"
+        st.download_button(
+            "📥 Download Shortlisted Candidates (Excel)",
+            buf,
+            file_name="shortlisted_candidates.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"download_excel_{key_suffix}",
         )
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.session_state.results_html_table = wrapper
+    else:
+        st.info("No candidates to display after filters.")
+
+# Helper: read zip
+def read_zip_to_files(zip_file):
+    try:
+        zip_file.seek(0)
+        z = zipfile.ZipFile(io.BytesIO(zip_file.read()))
+        files = []
+        for name in z.namelist():
+            if name.lower().endswith(('.pdf', '.docx', '.txt')):
+                try:
+                    data = z.read(name)
+                    bio = io.BytesIO(data)
+                    bio.name = os.path.basename(name)
+                    files.append(bio)
+                except:
+                    continue
+        return files
+    except Exception as e:
+        st.error(f"Failed to process zip file: {e}")
+        return []
+
+# ----------------------------------------------------------------------------------------------------------------------
+# PROCESS ACTION — now using LLM-first flow with fallbacks to local extraction
+# ----------------------------------------------------------------------------------------------------------------------
+if process_button:
+    combined_resumes = list(st.session_state.get("resume_files") or [])
+    if st.session_state.get("resume_zip"):
+        combined_resumes.extend(read_zip_to_files(st.session_state.resume_zip))
+
+    jd_from_form = st.session_state.jd_form_payload is not None
+
+    if not (jd_from_form or st.session_state.get("jd_file")):
+        st.warning("Please provide a Job Description via Form or File.")
+    elif not combined_resumes:
+        st.warning("Please upload at least one resume (individual files or a zip).")
+    else:
+        # Resolve JD payload (same as before)
+        if jd_from_form:
+            p = st.session_state.jd_form_payload
+            jd_min_exp = p["min_exp"]
+            jd_mandatory = set(p["mandatory"])
+            jd_optional = set(p["optional"])
+            jd_all_skills = jd_mandatory | jd_optional
+        else:
+            jd_file = st.session_state.jd_file
+            if jd_file.type == "application/pdf":
+                jd_text = extract_text_from_pdf(jd_file)
+            else:
+                jd_text = extract_text_from_txt(jd_file)
+            jd_all_skills = get_keywords_from_jd(jd_text)
+            jd_mandatory = set(st.session_state.jd_mandatory_from_file or set())
+            jd_optional = jd_all_skills - jd_mandatory
+            jd_min_exp = 0
+            for pat in [r'(\d+)\s*\+\s*years', r'(\d+)\s*\-\s*\d+\s*years',
+                        r'minimum\s*of\s*(\d+)\s*years', r'at\s*least\s*(\d+)\s*years',
+                        r'(\d+)\s*years\s*of\s*experience']:
+                found = re.findall(pat, jd_text)
+                if found:
+                    try:
+                        jd_min_exp = int(found[0])
+                        break
+                    except:
+                        pass
+
+        # ------------------ Process resumes (with percent indicator) ------------------
+        results = []
+        total = len(combined_resumes)
+
+        # progress UI: progress bar + percentage label
+        progress_bar = st.progress(0)
+        progress_label = st.empty()  # we'll use this to show "xx% — n/total processed"
+
+        def _update_progress(i, total):
+            if total <= 0:
+                pct = 100
+            else:
+                pct = int(((i) / total) * 100)
+                if pct > 100:
+                    pct = 100
+            # update progress bar (expects fraction 0..1)
+            frac = min(max(i / max(1, total), 0.0), 1.0)
+            progress_bar.progress(frac)
+            # show percentage with processed count
+            progress_label.markdown(f"**Progress:** {pct}% — {i}/{total} processed")
+
+        # initialize display
+        _update_progress(0, total)
+
+        def status_badge(status, reason=""):
+            color = {"selected": "green", "needs review": "orange", "rejected": "red"}[status]
+            label = {
+                "selected": "Selected",
+                "rejected": "Rejected",
+                "needs review": "Needs Review — Manual Check"
+            }[status]
+            return f'<span class="badge {color}">{label}</span>' + (f' <span class="small-note">({reason})</span>' if reason else "")
+
+        for idx, rf in enumerate(combined_resumes, start=1):
+            fname = getattr(rf, "name", f"resume_{idx}")
+            txt = ""
+            try:
+                if fname.lower().endswith(".pdf"):
+                    txt = extract_text_from_pdf(rf)
+                elif fname.lower().endswith(".docx"):
+                    txt = extract_text_from_docx(rf)
+                else:
+                    txt = extract_text_from_txt(rf)
+            except Exception:
+                txt = ""
+
+            # 1) Skills extraction: ask LLM first, fallback to local get_skills_from_text
+            skills_list, raw_sk = call_gemini_for_skills(txt)
+            if not skills_list:
+                # fallback to local extractor
+                local_skills = get_skills_from_text(txt)
+                skills_set = set(local_skills)
+            else:
+                skills_set = set(skills_list)
+
+            # 2) Experience extraction: ask LLM first, fallback to local extractor
+            years_decimal, raw_exp = call_gemini_for_years(txt)
+            if years_decimal == 0.0:
+                # local fallback
+                years_decimal = extract_experience_from_resume(txt, filename=fname, aggressive_edu=aggressive_edu_exclusion)
+
+            # 3) Compute score using sets (ensures consistent response shape)
+            scoring = compute_score_from_sets(
+                resume_skillset=skills_set,
+                resume_exp=years_decimal,
+                jd_all_skills=jd_all_skills,
+                jd_mandatory=jd_mandatory,
+                jd_optional=jd_optional,
+                jd_min_exp=jd_min_exp
+            )
+
+            # (your debug / print block left unchanged)
+            src_info = EXTRACT_DEBUG_REGISTRY.get(fname, {})
+            src = src_info.get("source", "n/a")
+            print("\n" + "-"*78)
+            print(f"📄 RESUME REPORT: {fname}")
+            print("-"*78)
+            print(f"• Matched Mandatory ({len(scoring['matched_mandatory'])}): {', '.join(scoring['matched_mandatory']) or '—'}")
+            print(f"• Missing Mandatory ({len(scoring['missing_mandatory'])}): {', '.join(scoring['missing_mandatory']) or '—'}")
+            if jd_optional:
+                print(f"• Matched Optional ({len(scoring['matched_optional'])}): {', '.join(scoring['matched_optional']) or '—'}")
+            print(f"• Experience : {format_exp_years(scoring['exp_years'])} (source: {src})")
+            if src_info.get("structured_intervals"):
+                print("• Intervals (structured):")
+                for s,e in src_info["structured_intervals"]:
+                    print(f" - {s} → {e}")
+            if src_info.get("date_range_intervals"):
+                print("• Intervals (date ranges):")
+                for s,e in src_info["date_range_intervals"]:
+                    print(f" - {s} → {e}")
+            if src_info.get("explicit_values"):
+                print(f"• Explicit numeric mentions: {src_info['explicit_values']}")
+            print(f"• JD Min Exp : {jd_min_exp} years")
+            print(f"• Score : {scoring['score']}")
+            print(f"• Status : {scoring['status'].upper()} ({scoring['reason']})")
+            print("-"*78)
+
+            missing_all = sorted(list((jd_all_skills - set(scoring["matched_all"])))) if jd_all_skills else []
+
+            results.append({
+                "Candidate Name": os.path.splitext(fname)[0],
+                "Score": scoring["score"],
+                "Years Experience": format_exp_years(scoring["exp_years"]),
+                "Status": status_badge(scoring["status"], scoring["reason"]),
+                "Matched Mandatory Count": len(scoring["matched_mandatory"]),
+                "Mandatory Missing Count": len(scoring["missing_mandatory"]),
+                "Matched Mandatory": ", ".join(scoring["matched_mandatory"]),
+                "Mandatory Missing": ", ".join(scoring["missing_mandatory"]),
+                "Matched Optional": ", ".join(scoring["matched_optional"]),
+                "Matched (All JD Skills)": ", ".join(scoring["matched_all"]),
+                "Unmatched (All JD Skills)": ", ".join(missing_all),
+                "Filename": fname
+            })
+
+            # update progress display (pass idx so we show processed count)
+            _update_progress(idx, total)
+
+        # finalize progress UI
+        _update_progress(total, total)
+        progress_label.markdown(f"**Progress:** 100% — Completed ({total}/{total})")
+
+
+        df = pd.DataFrame(sorted(results, key=lambda x: (x['Score'], -x["Mandatory Missing Count"]), reverse=True))
+        st.session_state.results_df = df
+
+        if not df.empty:
+            tk = df.head(3)
+            st.session_state.last_summary = tk.to_dict('records')
+        else:
+            st.session_state.last_summary = None
+
+        st.session_state.show_results_now = True
+        st.toast("Shortlisting complete. Showing results…", icon="📊")
+        st.rerun()
+
+# Auto show results area
+if st.session_state.show_results_now and st.session_state.results_df is not None:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("Results")
+    render_results_block(
+        st.session_state.results_df,
+        0, set(), set(), set(),
+        key_suffix="autoshow"
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
