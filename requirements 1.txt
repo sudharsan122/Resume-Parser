@@ -1,4 +1,5 @@
 streamlit
+docx
 pandas
 numpy
 python-docx
